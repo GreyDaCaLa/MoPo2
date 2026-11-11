@@ -42,15 +42,15 @@ test('ready is blocked while a prompt is open', () => {
   assert.throws(() => ready(s, 'a'), /open decisions/);
 });
 
-test('collision: both land on the same street — first to buy wins', () => {
-  let s = party();
+test('collision: both land on the same street — they settle it with an auction', () => {
+  let s = party(); // auctions for passed streets are off, contested ones still auction
   s = ready(s, 'a');
   s = ready(s, 'b', 2, 4, 1, 5); // both -> 6
-  assert.equal(promptOf(s, 'a', 'buy').data.contested, true);
-  assert.equal(promptOf(s, 'b', 'buy').data.contested, true);
-  s = answer(s, 'b', 'buy', 'buy');
-  assert.equal(s.properties[6].owner, 'b');
   assert.equal(promptOf(s, 'a', 'buy'), undefined);
+  assert.equal(s.auctions.length, 1);
+  assert.equal(s.auctions[0].reason, 'contested');
+  assert.deepEqual(s.auctions[0].participants, ['a', 'b']);
+  assert.ok(promptOf(s, 'a', 'auction') && promptOf(s, 'b', 'auction'));
 });
 
 test('doubles: bonus rollers ready and roll together before the turn ends', () => {
@@ -93,7 +93,7 @@ test('turn limit ends the game; richest wins', () => {
   s.turn.number = 20; // fast-forward to the last turn
   s.properties[39].owner = 'b';
   s = ready(s, 'a');
-  s = ready(s, 'b', 1, 2, 1, 2); // both -> 3
+  s = ready(s, 'b', 1, 2, 2, 4); // a -> 3, b -> 6
   s = answer(s, 'a', 'buy', 'pass');
   s = answer(s, 'b', 'buy', 'pass');
   s = ready(s, 'a');
@@ -138,4 +138,18 @@ test('time limit: richest by net worth wins', () => {
   s = endByTime(s);
   assert.equal(s.phase, 'ended');
   assert.equal(s.winner, 'b');
+});
+
+test('a bonus roll waits until every open landing decision is settled', () => {
+  let s = newGame({ mode: 'party' });
+  s = ready(s, 'a');
+  s = ready(s, 'b', 3, 3, 1, 2); // a doubles -> 6, b -> 3
+  assert.deepEqual(s.turn.rollers, ['a']);
+  s = answer(s, 'a', 'buy', 'pass');
+  s = ready(s, 'a');
+  assert.equal(player(s, 'a').position, 6, 'bonus roll held while b is still deciding');
+  assert.deepEqual(waitingOn(s), ['b']);
+  s = answer(s, 'b', 'buy', 'buy', 1, 2); // b settles it -> a's bonus roll fires
+  assert.equal(s.properties[3].owner, 'b');
+  assert.equal(player(s, 'a').position, 9);
 });

@@ -12,7 +12,7 @@ export const noShuffle = () => 0.999; // keeps seat and deck order
 export function newGame(settings = {}, names = ['a', 'b']) {
   let s = createGame('TEST');
   for (const n of names) s = addPlayer(s, n, n.toUpperCase());
-  s = updateSettings(s, names[0], settings);
+  s = updateSettings(s, names[0], { auctions: false, ...settings }); // auction tests opt in
   return startGame(s, names[0], { rng: noShuffle, now: 0 });
 }
 

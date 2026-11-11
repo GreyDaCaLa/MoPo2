@@ -163,3 +163,14 @@ test('pieces: unique tokens and colors, lobby only', () => {
   s = startGame(s, 'a', noShuffle);
   assert.throws(() => customizePlayer(s, 'a', { token: 'boat' }), GameError);
 });
+
+test('bankruptcy hands over transit/utility without corrupting the creditor\'s money', () => {
+  let s = newGame({}, ['a', 'b', 'c']);
+  s.properties[5].owner = 'b'; // transit (no houseCost)
+  s.properties[12].owner = 'b'; // utility
+  s.players[1].debtTo = 'a';
+  s = applyAction(s, 'b', { type: 'bankrupt' });
+  assert.equal(s.properties[5].owner, 'a');
+  assert.ok(Number.isFinite(player(s, 'a').money));
+  assert.equal(player(s, 'a').money, 1500 + 1500);
+});

@@ -73,6 +73,9 @@ export function createGame(code, settings) {
     },
     prompts: [], // { id, player, kind, data }
     nextPromptId: 1,
+    auctions: [], // see "auctions" below
+    nextAuctionId: 1,
+    nextBidOrder: 1, // sealed bids: who locked in first
     lastRolls: null, // { id, rolls: [{ player, d1, d2 }] } — the latest roll event
     pot: 0, // Harbor Rest jackpot
     properties: Object.fromEntries(OWNABLE.map((i) => [i, { owner: null, houses: 0, mortgaged: false }])),
@@ -107,6 +110,7 @@ export function addPlayer(state, id, name) {
     bankrupt: false,
     debtTo: null,
     connected: true,
+    bot: null, // { difficulty } for computer players
   });
   if (!s.hostId) s.hostId = id;
   log(s, `${s.players.at(-1).name} joined.`);
@@ -117,7 +121,7 @@ export function removePlayer(state, id) {
   if (state.phase !== 'lobby') return state;
   const s = structuredClone(state);
   s.players = s.players.filter((p) => p.id !== id);
-  if (s.hostId === id) s.hostId = s.players[0]?.id ?? null;
+  if (s.hostId === id) s.hostId = s.players.find((p) => !p.bot)?.id ?? null; // never a bot
   return s;
 }
 
@@ -270,7 +274,7 @@ function moveTo(s, p, to) {
 
 // ---------------------------------------------------------------- prompts
 
-export const PROMPT_DEFAULTS = { buy: 'pass', jail: 'roll', card: 'ok' };
+export const PROMPT_DEFAULTS = { buy: 'pass', jail: 'roll', card: 'ok', auction: 'pass' };
 
 function addPrompt(s, player, kind, data = {}) {
   const prompt = { id: s.nextPromptId++, player: player.id, kind, data };
@@ -280,7 +284,10 @@ function addPrompt(s, player, kind, data = {}) {
 
 const promptsOf = (s, playerId) => s.prompts.filter((p) => p.player === playerId);
 
-function resolveLanding(s, p, diceTotal) {
+/** Open decisions caused by landings (everything except Lockup, which is about the next roll). */
+export const landingPrompts = (s) => s.prompts.filter((p) => p.kind !== 'jail');
+
+function resolveLanding(s, p, diceTotal, ctx) {
   const space = SPACES[p.position];
   log(s, `${p.name} landed on ${space.name}.`);
   switch (space.type) {
@@ -289,11 +296,21 @@ function resolveLanding(s, p, diceTotal) {
     case 'utility': {
       const prop = s.properties[space.index];
       if (!prop.owner) {
-        const rivals = s.prompts.filter((x) => x.kind === 'buy' && x.data.index === space.index);
-        const prompt = addPrompt(s, p, 'buy', { index: space.index, contested: rivals.length > 0 });
-        for (const r of rivals) r.data.contested = true;
-        if (rivals.length) log(s, `${space.name} is contested — first to buy gets it!`);
-        return prompt;
+        if (s.auctions.some((a) => a.index === space.index)) {
+          log(s, `${space.name} is already up for auction.`);
+          break;
+        }
+        // Someone else is still deciding on this street: it's contested, so the
+        // players who landed there settle it with an auction.
+        const rival = s.prompts.find((x) => x.kind === 'buy' && x.data.index === space.index);
+        if (rival) {
+          s.prompts = s.prompts.filter((x) => x.id !== rival.id);
+          log(s, `${space.name} is contested!`);
+          startAuction(s, space.index, [rival.player, p.id], 'contested', ctx);
+          break;
+        }
+        addPrompt(s, p, 'buy', { index: space.index });
+        break;
       }
       if (prop.owner !== p.id) {
         const owner = playerById(s, prop.owner);
@@ -325,7 +342,7 @@ function resolveLanding(s, p, diceTotal) {
   }
 }
 
-function applyCard(s, p, { deck, cardIdx, text, diceTotal }) {
+function applyCard(s, p, { deck, cardIdx, text, diceTotal }, ctx) {
   const e = CARDS[deck][cardIdx].effect;
   log(s, `${p.name}: "${text}"`);
   if (e.type === 'jailCard') p.jailCards.push(deck); // returned to the deck when used
@@ -338,17 +355,17 @@ function applyCard(s, p, { deck, cardIdx, text, diceTotal }) {
       break;
     case 'moveTo':
       moveTo(s, p, e.to);
-      resolveLanding(s, p, diceTotal);
+      resolveLanding(s, p, diceTotal, ctx);
       break;
     case 'moveBy':
       p.position = (p.position + e.amount + 40) % 40;
-      resolveLanding(s, p, diceTotal);
+      resolveLanding(s, p, diceTotal, ctx);
       break;
     case 'moveNearest': {
       let i = p.position;
       do { i = (i + 1) % 40; } while (SPACES[i].type !== e.kind);
       moveTo(s, p, i);
-      resolveLanding(s, p, diceTotal);
+      resolveLanding(s, p, diceTotal, ctx);
       break;
     }
     case 'gotoJail':
@@ -373,7 +390,7 @@ function applyCard(s, p, { deck, cardIdx, text, diceTotal }) {
   }
 }
 
-function answerPrompt(s, me, prompt, choice) {
+function answerPrompt(s, me, prompt, choice, ctx) {
   // Validate first; only remove the prompt once the choice is legal.
   const done = () => { s.prompts = s.prompts.filter((x) => x.id !== prompt.id); };
   switch (prompt.kind) {
@@ -382,7 +399,10 @@ function answerPrompt(s, me, prompt, choice) {
       if (choice === 'pass') {
         done();
         log(s, `${me.name} passed on ${space.name}.`);
-        // TODO: auction
+        if (s.settings.auctions) {
+          const bidders = alive(s).filter((p) => p.id !== me.id).map((p) => p.id);
+          startAuction(s, space.index, bidders, 'passed', ctx);
+        }
         return;
       }
       if (choice !== 'buy') fail('Choose buy or pass');
@@ -391,11 +411,6 @@ function answerPrompt(s, me, prompt, choice) {
       me.money -= space.price;
       s.properties[space.index].owner = me.id;
       log(s, `${me.name} bought ${space.name} for ${fmt(space.price)}.`);
-      // Anyone else holding an offer on this street just lost the race.
-      for (const r of s.prompts.filter((x) => x.kind === 'buy' && x.data.index === space.index)) {
-        log(s, `${me.name} beat ${playerById(s, r.player).name} to ${space.name}.`);
-      }
-      s.prompts = s.prompts.filter((x) => !(x.kind === 'buy' && x.data.index === space.index));
       return;
     }
     case 'jail': {
@@ -419,10 +434,201 @@ function answerPrompt(s, me, prompt, choice) {
     }
     case 'card':
       done();
-      applyCard(s, me, prompt.data);
+      applyCard(s, me, prompt.data, ctx);
+      return;
+    case 'auction':
+      auctionAnswer(s, me, prompt, choice, ctx);
       return;
   }
 }
+
+// ---------------------------------------------------------------- auctions
+//
+// An auction is a shared object in `state.auctions`; each bidder who still
+// owes a decision has an 'auction' prompt pointing at it, so auctions hold up
+// bonus rolls and the end of the turn like any other landing decision.
+//
+//   LIVE   — open ascending bids; a countdown (settings.liveBidTime) restarts
+//            on every bid. The high bidder can't drop out. Ends when the clock
+//            runs out (the server calls `tickAuctions`) or everyone else drops.
+//
+//   SEALED — up to 3 waves of secret bids. After wave 1 the top 3 advance,
+//            after wave 2 the top 2 (ties at the cut-off advance too); wave 3's
+//            highest bid wins, ties going to whoever locked in first. Passing
+//            drops you out. Between waves only the previous top amount is public.
+//            If everyone passes in a later wave, the previous leader wins.
+//
+// Answers: { bid: amount } or 'pass' (in live auctions 'pass' = drop out).
+
+export const LIVE_MIN_BID = 10;
+
+function auctionById(s, id) {
+  const a = s.auctions.find((x) => x.id === id);
+  if (!a) fail('That auction is over');
+  return a;
+}
+
+function startAuction(s, index, participantIds, reason, ctx) {
+  const space = SPACES[index];
+  const ids = participantIds.filter((id) => !playerById(s, id).bankrupt);
+  if (!ids.length) {
+    log(s, `Nobody is left to bid on ${space.name}.`);
+    return;
+  }
+  const format = s.settings.auctionFormat;
+  const a = {
+    id: s.nextAuctionId++,
+    index,
+    format,
+    reason, // 'passed' | 'contested'
+    participants: ids, // still in the running
+    // live
+    highBid: 0,
+    highBidder: null,
+    endsAt: format === 'live' ? ctx.now + s.settings.liveBidTime * 1000 : null,
+    // sealed
+    wave: 1,
+    bids: {}, // playerId -> { amount, order } for the current wave (hidden from clients)
+    lastTopBid: null, // top amount of the previous wave (public)
+    prevLeader: null, // fallback winner if everyone passes in a later wave
+  };
+  s.auctions.push(a);
+  for (const id of ids) addPrompt(s, playerById(s, id), 'auction', { auctionId: a.id });
+  const who = ids.map((id) => playerById(s, id).name).join(', ');
+  log(s, `${space.name} goes to a ${format === 'live' ? 'live' : 'sealed-bid'} auction between ${who}!`);
+}
+
+function endAuction(s, a, winnerId, price) {
+  const space = SPACES[a.index];
+  s.auctions = s.auctions.filter((x) => x.id !== a.id);
+  s.prompts = s.prompts.filter((x) => !(x.kind === 'auction' && x.data.auctionId === a.id));
+  const winner = winnerId && playerById(s, winnerId);
+  if (!winner || winner.bankrupt || s.properties[a.index].owner) {
+    log(s, `Nobody won ${space.name} — it stays with the bank.`);
+    return;
+  }
+  pay(s, winner, null, price, `auction for ${space.name}`);
+  s.properties[a.index].owner = winner.id;
+  log(s, `${winner.name} won ${space.name} at auction for ${fmt(price)}.`);
+}
+
+function removeFromAuction(s, a, playerId) {
+  a.participants = a.participants.filter((id) => id !== playerId);
+  delete a.bids[playerId];
+  s.prompts = s.prompts.filter((x) => !(x.kind === 'auction' && x.data.auctionId === a.id && x.player === playerId));
+  if (a.highBidder === playerId) {
+    a.highBidder = null;
+    a.highBid = 0;
+  }
+}
+
+function checkLiveAuction(s, a) {
+  if (!a.participants.length) endAuction(s, a, null, 0);
+  else if (a.participants.length === 1 && a.highBidder === a.participants[0]) endAuction(s, a, a.highBidder, a.highBid);
+}
+
+function resolveSealedWave(s, a) {
+  const entries = a.participants
+    .filter((id) => a.bids[id])
+    .map((id) => ({ id, ...a.bids[id] }))
+    .sort((x, y) => y.amount - x.amount || x.order - y.order);
+  if (!entries.length) {
+    if (a.prevLeader) endAuction(s, a, a.prevLeader.id, a.prevLeader.amount);
+    else endAuction(s, a, null, 0);
+    return;
+  }
+  if (a.wave === 3 || entries.length === 1) {
+    endAuction(s, a, entries[0].id, entries[0].amount);
+    return;
+  }
+  const keep = a.wave === 1 ? 3 : 2;
+  const cutoff = entries[Math.min(keep, entries.length) - 1].amount;
+  const advancing = entries.filter((e) => e.amount >= cutoff);
+  if (advancing.length === 1) {
+    endAuction(s, a, advancing[0].id, advancing[0].amount);
+    return;
+  }
+  a.prevLeader = { id: entries[0].id, amount: entries[0].amount };
+  a.lastTopBid = entries[0].amount;
+  a.wave++;
+  a.participants = advancing.map((e) => e.id);
+  a.bids = {};
+  for (const id of a.participants) addPrompt(s, playerById(s, id), 'auction', { auctionId: a.id });
+  log(s, `Wave ${a.wave - 1} closed (top bid ${fmt(a.lastTopBid)}). ${a.participants.map((id) => playerById(s, id).name).join(', ')} advance to wave ${a.wave}.`);
+}
+
+function parseBid(choice) {
+  const amount = Math.floor(Number(choice?.bid));
+  if (!Number.isFinite(amount) || amount < 1) fail('Enter a bid of at least $1');
+  return amount;
+}
+
+function auctionAnswer(s, me, prompt, choice, ctx) {
+  const a = auctionById(s, prompt.data.auctionId);
+  const space = SPACES[a.index];
+
+  if (a.format === 'live') {
+    if (choice === 'pass') {
+      if (a.highBidder === me.id) fail("You're the high bidder — you can't drop out");
+      removeFromAuction(s, a, me.id);
+      log(s, `${me.name} dropped out of the bidding for ${space.name}.`);
+      checkLiveAuction(s, a);
+      return;
+    }
+    const amount = parseBid(choice);
+    if (a.highBidder === me.id) fail("You're already the high bidder");
+    const min = Math.max(LIVE_MIN_BID, a.highBid + 1);
+    if (amount < min) fail(`Bid at least ${fmt(min)}`);
+    if (amount > me.money) fail("You can't bid more than your cash");
+    a.highBid = amount;
+    a.highBidder = me.id;
+    a.endsAt = ctx.now + s.settings.liveBidTime * 1000;
+    log(s, `${me.name} bids ${fmt(amount)} for ${space.name}.`);
+    checkLiveAuction(s, a);
+    return;
+  }
+
+  // sealed
+  if (a.bids[me.id]) fail('You already locked in a bid this wave');
+  if (choice === 'pass') {
+    removeFromAuction(s, a, me.id);
+    log(s, `${me.name} passed on the ${space.name} auction.`);
+  } else {
+    const amount = parseBid(choice);
+    if (amount > me.money) fail("You can't bid more than your cash");
+    a.bids[me.id] = { amount, order: s.nextBidOrder++ };
+    s.prompts = s.prompts.filter((x) => x.id !== prompt.id);
+    log(s, `${me.name} locked in a bid.`);
+  }
+  if (a.participants.every((id) => a.bids[id])) resolveSealedWave(s, a);
+}
+
+/** Close live auctions whose countdown has run out (or all of them, when forced). */
+function closeLiveAuctions(s, ctx, force = false) {
+  for (const a of [...s.auctions]) {
+    if (a.format === 'live' && (force || ctx.now >= a.endsAt)) endAuction(s, a, a.highBidder, a.highBid);
+  }
+}
+
+/** Earliest live-auction deadline, for the server's timer. */
+export function nextAuctionDeadline(s) {
+  if (s.phase !== 'playing') return null;
+  const times = s.auctions.filter((a) => a.format === 'live').map((a) => a.endsAt);
+  return times.length ? Math.min(...times) : null;
+}
+
+/** Server tick: sell live auctions whose countdown has expired. */
+export function tickAuctions(state, opts) {
+  const ctx = ctxOf(opts);
+  if (state.phase !== 'playing') return state;
+  if (!state.auctions.some((a) => a.format === 'live' && ctx.now >= a.endsAt)) return state;
+  const s = structuredClone(state);
+  closeLiveAuctions(s, ctx);
+  settle(s, ctx);
+  s.seq++;
+  return s;
+}
+
 
 // ---------------------------------------------------------------- turn flow
 
@@ -434,10 +640,16 @@ function setDeadline(s, ctx) {
 export function waitingOn(s) {
   const t = s.turn;
   if (s.phase !== 'playing') return [];
-  if (t.rollers.length) return t.rollers.filter((id) => !t.ready.includes(id));
-  if (isParty(s)) return alive(s).filter((p) => !t.ready.includes(p.id)).map((p) => p.id);
+  if (t.rollers.length) {
+    // A roll waits for its rollers to ready AND for every open landing decision
+    // to settle, so ownership is decided before anyone moves again.
+    const deciding = landingPrompts(s).map((p) => p.player);
+    return [...new Set([...t.rollers.filter((id) => !t.ready.includes(id)), ...deciding])];
+  }
+  const deciding = landingPrompts(s).map((p) => p.player);
+  if (isParty(s)) return [...new Set([...alive(s).filter((p) => !t.ready.includes(p.id)).map((p) => p.id), ...deciding])];
   const cur = s.players[t.current];
-  return t.ready.includes(cur.id) ? [] : [cur.id];
+  return [...new Set([...(t.ready.includes(cur.id) ? [] : [cur.id]), ...deciding])];
 }
 
 function beginTurn(s, ctx) {
@@ -529,7 +741,7 @@ function rollEvent(s, ids, ctx) {
   }
 
   for (const r of movers) moveTo(s, r.p, (r.p.position + r.total) % 40);
-  for (const r of movers) resolveLanding(s, r.p, r.total);
+  for (const r of movers) resolveLanding(s, r.p, r.total, ctx);
 
   t.rollers = t.rollers.filter((id) => { const p = playerById(s, id); return !p.inJail && !p.bankrupt; });
   t.bonus = t.rollers.length > 0;
@@ -558,7 +770,7 @@ function settle(s, ctx) {
     t.ready = t.ready.filter((id) => !playerById(s, id).bankrupt);
     ensureJailPrompts(s);
 
-    if (t.rollers.length && t.rollers.every((id) => t.ready.includes(id))) {
+    if (t.rollers.length && t.rollers.every((id) => t.ready.includes(id)) && !landingPrompts(s).length) {
       rollEvent(s, t.rollers, ctx);
       continue;
     }
@@ -566,7 +778,7 @@ function settle(s, ctx) {
       const done = isParty(s)
         ? alive(s).every((p) => t.ready.includes(p.id))
         : s.players[t.current].bankrupt || t.ready.includes(s.players[t.current].id);
-      if (done) {
+      if (done && !landingPrompts(s).length) {
         nextTurn(s, ctx);
         continue;
       }
@@ -605,7 +817,7 @@ function goBankrupt(s, me, reason = '') {
     const prop = s.properties[i];
     if (prop.owner !== me.id) continue;
     if (heir) {
-      heir.money += (prop.houses * SPACES[i].houseCost) / 2; // bank buys back buildings
+      heir.money += (prop.houses * (SPACES[i].houseCost || 0)) / 2; // bank buys back buildings
       s.properties[i] = { owner: heir.id, houses: 0, mortgaged: prop.mortgaged };
     } else {
       s.properties[i] = { owner: null, houses: 0, mortgaged: false };
@@ -618,6 +830,11 @@ function goBankrupt(s, me, reason = '') {
   }
   // Return any card this player was still looking at.
   for (const pr of promptsOf(s, me.id)) if (pr.kind === 'card') s.decks[pr.data.deck].push(pr.data.cardIdx);
+  for (const a of s.auctions.filter((x) => x.participants.includes(me.id))) {
+    removeFromAuction(s, a, me.id);
+    if (a.format === 'live') checkLiveAuction(s, a);
+    else if (a.participants.every((id) => a.bids[id])) resolveSealedWave(s, a);
+  }
   s.prompts = s.prompts.filter((x) => x.player !== me.id);
   me.jailCards = [];
   me.money = 0;
@@ -665,7 +882,7 @@ export function applyAction(state, playerId, action, opts) {
     case 'answer': {
       const prompt = s.prompts.find((x) => x.id === action.promptId && x.player === me.id);
       if (!prompt) fail('That decision is no longer open');
-      answerPrompt(s, me, prompt, action.choice);
+      answerPrompt(s, me, prompt, action.choice, ctx);
       break;
     }
 
@@ -747,11 +964,12 @@ export function expireTurn(state, opts) {
   if (state.phase !== 'playing' || !state.turn.deadline || ctx.now < state.turn.deadline) return state;
   const s = structuredClone(state);
   log(s, "Time's up for this turn!");
+  closeLiveAuctions(s, ctx, true); // sold to the current high bidder, if any
   for (let guard = 0; guard < 50 && s.prompts.length; guard++) {
-    const prompt = s.prompts[0];
+    const prompt = s.prompts.find((x) => x.kind !== 'jail') ?? s.prompts[0]; // Lockup choice last
     const p = playerById(s, prompt.player);
     try {
-      answerPrompt(s, p, prompt, PROMPT_DEFAULTS[prompt.kind]);
+      answerPrompt(s, p, prompt, PROMPT_DEFAULTS[prompt.kind], ctx);
     } catch {
       s.prompts = s.prompts.filter((x) => x.id !== prompt.id);
     }

@@ -1,7 +1,8 @@
 import { randomUUID, randomInt } from 'node:crypto';
 import {
   createGame, addPlayer, removePlayer, startGame, applyAction, updateSettings, customizePlayer,
-  endByTime, expireTurn, GameError,
+  endByTime, expireTurn, tickAuctions, nextAuctionDeadline, GameError,
+  addBot, removeBot, setBotDifficulty, decideBotAction, botDelay,
 } from '@mopo/shared';
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -31,9 +32,12 @@ export class RoomManager {
 
   // Strip anything clients shouldn't see (upcoming card order). `serverNow`
   // lets clients correct for clock skew when showing countdowns.
+  // Sealed bid amounts are secret: clients only learn who has locked in.
   publicState(state) {
     const { decks, ...rest } = state;
-    return { ...rest, serverNow: Date.now() };
+    const auctions = state.auctions.map(({ bids, prevLeader, ...a }) =>
+      a.format === 'sealed' ? { ...a, lockedIn: Object.keys(bids) } : a);
+    return { ...rest, auctions, serverNow: Date.now() };
   }
 
   deleteRoom(code) {
@@ -42,6 +46,8 @@ export class RoomManager {
     clearTimeout(room.idleTimer);
     clearTimeout(room.endTimer);
     clearTimeout(room.turnTimer);
+    clearTimeout(room.botTimer);
+    clearTimeout(room.auctionTimer);
     this.rooms.delete(code);
   }
 
@@ -71,10 +77,65 @@ export class RoomManager {
     }, Math.max(0, deadline - Date.now()) + 50);
   }
 
+  /**
+   * Bot driver: one pending bot action per room at a time. When the timer
+   * fires we re-ask the bots against the *current* state (it may have changed
+   * while they were "thinking"), apply one action and broadcast, which
+   * schedules the next. Bots pause while no human is connected.
+   */
+  scheduleBots(code) {
+    const room = this.rooms.get(code);
+    if (!room || room.botTimer || room.state.phase !== 'playing') return;
+    if (!room.state.players.some((p) => !p.bot && p.connected)) return;
+    const next = this.nextBotAction(room.state);
+    if (!next) return;
+    room.botTimer = setTimeout(() => {
+      room.botTimer = null;
+      const now = this.nextBotAction(room.state);
+      if (now) {
+        try {
+          room.state = applyAction(room.state, now.bot.id, now.action, { now: Date.now() });
+        } catch (err) {
+          // A bot should never pick an illegal action; log it and let play continue.
+          console.error(`[${code}] bot ${now.bot.name} ${JSON.stringify(now.action)}: ${err.message}`);
+          room.botErrors = (room.botErrors || 0) + 1;
+          if (room.botErrors > 20) return; // stop retrying a broken bot
+        }
+      }
+      this.broadcast(code);
+    }, botDelay(next.bot.bot.difficulty, next.action));
+  }
+
+  nextBotAction(state) {
+    for (const bot of state.players) {
+      if (!bot.bot || bot.bankrupt) continue;
+      const action = decideBotAction(state, bot.id);
+      if (action) return { bot, action };
+    }
+    return null;
+  }
+
+  // Close live auctions when their countdown runs out.
+  scheduleAuctionTimer(code) {
+    const room = this.rooms.get(code);
+    const deadline = room ? nextAuctionDeadline(room.state) : null;
+    if (room?.auctionDeadline === deadline) return;
+    clearTimeout(room.auctionTimer);
+    room.auctionDeadline = deadline;
+    if (deadline == null) return;
+    room.auctionTimer = setTimeout(() => {
+      room.auctionDeadline = null;
+      room.state = tickAuctions(room.state, { now: Date.now() });
+      this.broadcast(code);
+    }, Math.max(0, deadline - Date.now()) + 30);
+  }
+
   broadcast(code) {
     const room = this.rooms.get(code);
     if (!room) return;
     this.scheduleTurnTimer(code);
+    this.scheduleAuctionTimer(code);
+    this.scheduleBots(code);
     this.io.to(code).emit('state', this.publicState(room.state));
   }
 
@@ -83,7 +144,7 @@ export class RoomManager {
     if (!room) return;
     const p = room.state.players.find((x) => x.id === playerId);
     if (p) p.connected = connected;
-    const anyone = room.state.players.some((x) => x.connected);
+    const anyone = room.state.players.some((x) => x.connected && !x.bot);
     clearTimeout(room.idleTimer);
     if (!anyone) {
       room.idleTimer = setTimeout(() => this.deleteRoom(code), ROOM_IDLE_MS);
@@ -151,7 +212,7 @@ export class RoomManager {
       this.sessions.delete(token);
       this.sockets.delete(socket.id);
       socket.leave(code);
-      if (room.state.players.length === 0) this.deleteRoom(code);
+      if (!room.state.players.some((p) => !p.bot)) this.deleteRoom(code); // only bots left
       else this.broadcast(code);
     }));
 
@@ -171,6 +232,24 @@ export class RoomManager {
     socket.on('player:customize', handle(({ token, color }) => {
       const { code, playerId, room } = session();
       room.state = customizePlayer(room.state, playerId, { token, color });
+      this.broadcast(code);
+    }));
+
+    socket.on('bot:add', handle(({ difficulty }) => {
+      const { code, playerId, room } = session();
+      room.state = addBot(room.state, playerId, difficulty);
+      this.broadcast(code);
+    }));
+
+    socket.on('bot:remove', handle(({ id }) => {
+      const { code, playerId, room } = session();
+      room.state = removeBot(room.state, playerId, id);
+      this.broadcast(code);
+    }));
+
+    socket.on('bot:difficulty', handle(({ id, difficulty }) => {
+      const { code, playerId, room } = session();
+      room.state = setBotDifficulty(room.state, playerId, id, difficulty);
       this.broadcast(code);
     }));
 

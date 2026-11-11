@@ -56,7 +56,7 @@ The engine (`shared/src/engine.js`) is built on three concepts:
 - **Actions** — optional, player-initiated, never block the game: build, sell, mortgage,
   bankruptcy (later: trading). Allowed any time.
 - **Prompts** — the game asking one player for a decision (`state.prompts`): buy/pass, how to
-  leave Lockup, a drawn card (later: auctions, trade responses). You can't ready up with one open.
+  leave Lockup, a drawn card, an auction bid (later: trade responses). You can't ready up with one open.
   Each prompt kind has a default used when the turn timer runs out.
 
 ```
@@ -71,10 +71,41 @@ Turn N
 
 - **Classic** — the same flow with one roller at a time, in seat order. Ready is labelled
   "Roll dice" / "Roll again" / "End turn". The turn number counts full rounds.
-- **Party** — everyone rolls together each turn. If two players land on the same unowned street,
-  both are offered it and the first to buy wins (auctions will replace this).
+- **Party** — everyone rolls together each turn. A doubles bonus roll waits until every open landing
+  decision (buy, card, auction) is settled, so ownership is always decided before anyone moves again.
+  If players land on the same unowned street in one roll, they settle it with an auction.
+
+## Auctions
+
+Rules page: **Auction passed streets** (on by default — everyone except the passer bids) and
+**Auction style**:
+
+- **Live bidding** — open, rising bids (min $10); a countdown (4/6/10s) restarts on every bid.
+  The high bidder can't drop out; it ends when the clock runs out or everyone else drops.
+- **Sealed (3 waves)** — secret bids. After wave 1 the top 3 advance, after wave 2 the top 2
+  (ties at the cut-off advance); wave 3's highest bid wins, ties going to whoever locked in first.
+  Only the previous wave's top amount is revealed. If everyone passes in a later wave, the
+  previous leader wins. The server never sends bid amounts to clients.
+
+Contested Party landings always auction (between just the players who landed there), even with
+passed-street auctions off. Auctions hold up bonus rolls and the end of a turn; the turn timer
+closes live auctions at the current high bid and auto-passes sealed bidders.
 
 Keys: Space = ready/roll, B = buy, P = pass, Enter = acknowledge card.
+
+## Bots
+
+The host can add bots on the room setup page (Easy / Medium / Hard) and play solo against them.
+
+- Bots are ordinary seats (`player.bot = { difficulty }`); the engine treats them like anyone else.
+- `shared/src/bots.js` — `decideBotAction(state, botId)` is a pure function returning the bot's next
+  action (answer a prompt, raise money, build, unmortgage, ready) or `null`.
+- The server's bot driver applies one bot action at a time after a short "thinking" delay
+  (Hard reacts fastest — it matters when streets are contested in Party). Bots pause when no
+  human is connected.
+- `npm run simulate -- 200 classic 50` plays bot-only games and prints win rates per difficulty
+  (args: games, mode, turn limit). Balance this once trading and auctions exist — without them
+  colour sets rarely complete and games stall.
 
 ## Rules implemented
 

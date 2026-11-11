@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
-import { TOKENS, PLAYER_COLORS, RULES, ruleApplies } from '@mopo/shared';
+import { TOKENS, PLAYER_COLORS, RULES, ruleApplies, BOT_DIFFICULTIES, MAX_PLAYERS } from '@mopo/shared';
 import { useGame, useMe } from '../net/store.js';
 import TokenModel from '../three/TokenModel.jsx';
 
@@ -191,6 +191,63 @@ function RulesPanel() {
   );
 }
 
+// ---------------------------------------------------------------- players & bots
+
+function PlayersPanel() {
+  const state = useGame((g) => g.state);
+  const playerId = useGame((g) => g.playerId);
+  const { addBot, removeBot, setBotDifficulty } = useGame();
+  const [difficulty, setDifficulty] = useState('medium');
+  const isHost = state.hostId === playerId;
+  const full = state.players.length >= MAX_PLAYERS;
+  const tokenName = (id) => TOKENS.find((t) => t.id === id)?.name;
+
+  return (
+    <section className="card setup-section">
+      <h3>Players ({state.players.length}/{MAX_PLAYERS})</h3>
+      <ul className="player-list">
+        {state.players.map((p) => (
+          <li key={p.id}>
+            <span className="swatch" style={{ background: p.color }} />
+            <span className="grow">{p.bot && <span aria-hidden>🤖 </span>}{p.name}</span>
+            <span className="muted small">{tokenName(p.token)}</span>
+            {p.bot && (isHost ? (
+              <select
+                className="bot-difficulty"
+                value={p.bot.difficulty}
+                onChange={(e) => setBotDifficulty(p.id, e.target.value)}
+                aria-label={`${p.name} difficulty`}
+              >
+                {BOT_DIFFICULTIES.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+              </select>
+            ) : (
+              <span className="tag">{BOT_DIFFICULTIES.find((d) => d.id === p.bot.difficulty)?.name}</span>
+            ))}
+            {p.id === state.hostId && <span className="tag">host</span>}
+            {p.id === playerId && <span className="tag">you</span>}
+            {p.bot && isHost && (
+              <button className="icon-btn" title={`Remove ${p.name}`} onClick={() => removeBot(p.id)}>×</button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {isHost && (
+        <div className="add-bot">
+          <div className="segmented">
+            {BOT_DIFFICULTIES.map((d) => (
+              <button key={d.id} className={difficulty === d.id ? 'on' : ''} title={d.description} onClick={() => setDifficulty(d.id)}>
+                {d.name}
+              </button>
+            ))}
+          </div>
+          <button onClick={() => addBot(difficulty)} disabled={full}>+ Add bot</button>
+        </div>
+      )}
+      {isHost && <p className="muted small">{BOT_DIFFICULTIES.find((d) => d.id === difficulty)?.description}</p>}
+    </section>
+  );
+}
+
 // ---------------------------------------------------------------- page
 
 export default function RoomSetup() {
@@ -199,7 +256,6 @@ export default function RoomSetup() {
   const startGame = useGame((g) => g.startGame);
   const leaveRoom = useGame((g) => g.leaveRoom);
   const isHost = state.hostId === playerId;
-  const tokenName = (id) => TOKENS.find((t) => t.id === id)?.name;
 
   return (
     <div className="setup">
@@ -222,20 +278,7 @@ export default function RoomSetup() {
 
       <div className="setup-grid">
         <div className="setup-col">
-          <section className="card setup-section">
-            <h3>Players ({state.players.length}/6)</h3>
-            <ul className="player-list">
-              {state.players.map((p) => (
-                <li key={p.id}>
-                  <span className="swatch" style={{ background: p.color }} />
-                  <span className="grow">{p.name}</span>
-                  <span className="muted small">{tokenName(p.token)}</span>
-                  {p.id === state.hostId && <span className="tag">host</span>}
-                  {p.id === playerId && <span className="tag">you</span>}
-                </li>
-              ))}
-            </ul>
-          </section>
+          <PlayersPanel />
           <PiecePicker />
         </div>
         <div className="setup-col">

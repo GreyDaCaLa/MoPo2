@@ -4,6 +4,7 @@
 //   key          property name in state.settings
 //   type         'choice' (pick one of `options`) | 'toggle' (boolean)
 //   modes        optional: only applies to these game modes (hidden otherwise)
+//   when         optional: (settings) => boolean — only shown when this holds
 //   group        heading on the setup page
 
 const opt = (value, label, description) => ({ value, label, description });
@@ -53,6 +54,35 @@ export const RULES = [
     default: false,
   },
   {
+    key: 'auctions',
+    group: 'Auctions',
+    label: 'Auction passed streets',
+    description: 'When a player passes on a street, everyone else can bid for it. (Players who land on the same street in Party always settle it with an auction.)',
+    type: 'toggle',
+    default: true,
+  },
+  {
+    key: 'auctionFormat',
+    group: 'Auctions',
+    label: 'Auction style',
+    type: 'choice',
+    default: 'live',
+    options: [
+      opt('live', 'Live bidding', 'Open, rising bids; a short countdown restarts on every bid.'),
+      opt('sealed', 'Sealed (3 waves)', 'Secret bids. Top 3 advance, then top 2, then the highest bid wins.'),
+    ],
+  },
+  {
+    key: 'liveBidTime',
+    group: 'Auctions',
+    when: (s) => s.auctionFormat === 'live',
+    label: 'Bid countdown',
+    description: 'Seconds without a new bid before the auction closes.',
+    type: 'choice',
+    default: 6,
+    options: [4, 6, 10].map((v) => opt(v, `${v}s`)),
+  },
+  {
     key: 'maxTurns',
     group: 'Game length',
     label: 'Turn limit',
@@ -95,4 +125,6 @@ export function sanitizeSettings(patch = {}, base = DEFAULT_SETTINGS) {
   return out;
 }
 
-export const ruleApplies = (rule, settings) => !rule.modes || rule.modes.includes(settings.mode);
+/** Whether a rule is relevant (and shown) under the current settings. */
+export const ruleApplies = (rule, settings) =>
+  (!rule.modes || rule.modes.includes(settings.mode)) && (!rule.when || rule.when(settings));

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { SPACES, GROUPS, BAIL, computeRent, waitingOn, raisableValue } from '@mopo/shared';
 import { useGame, useMe, useServerNow } from '../net/store.js';
+import { AuctionPrompt, AuctionWatch } from './Auction.jsx';
 
 const nameOf = (state, id) => state.players.find((p) => p.id === id)?.name ?? '?';
 const isParty = (state) => state.settings.mode === 'party';
@@ -21,8 +22,9 @@ function Players() {
           <div key={p.id} className={`player ${active ? 'active' : ''} ${p.bankrupt ? 'out' : ''}`}>
             <span className="swatch" style={{ background: p.color }} />
             <span className="name">
-              {p.name}{p.id === playerId && ' (you)'}
-              {!p.connected && <span className="tag">offline</span>}
+              {p.bot && <span aria-hidden>🤖 </span>}{p.name}{p.id === playerId && ' (you)'}
+              {p.bot && <span className="tag">{p.bot.difficulty}</span>}
+              {!p.connected && !p.bot && <span className="tag">offline</span>}
               {p.inJail && <span className="tag">lockup</span>}
             </span>
             {party && !p.bankrupt && (
@@ -46,7 +48,6 @@ function BuyPrompt({ prompt, me, act }) {
       <div className="prompt-band" style={{ background: group.color }}>{group.name}</div>
       <p>
         Buy <b>{space.name}</b> for ${space.price}?
-        {prompt.data.contested && <span className="tag urgent">contested — first to buy wins</span>}
       </p>
       <div className="row">
         <button onClick={() => act({ type: 'answer', promptId: prompt.id, choice: 'buy' })} disabled={me.money < space.price}>
@@ -62,6 +63,7 @@ function BuyPrompt({ prompt, me, act }) {
 
 function JailPrompt({ prompt, me, act }) {
   const choose = (choice) => act({ type: 'answer', promptId: prompt.id, choice });
+  const othersOpen = useGame((g) => g.state.prompts.some((p) => p.player === me.id && p.kind !== 'jail'));
   return (
     <div className="prompt">
       <div className="prompt-band" style={{ background: '#3d3d3d' }}>Lockup</div>
@@ -69,7 +71,9 @@ function JailPrompt({ prompt, me, act }) {
         You're in Lockup{me.jailTurns > 0 && ` (attempt ${me.jailTurns + 1} of 3)`}. How do you want to get out?
       </p>
       <div className="row wrap">
-        <button onClick={() => choose('roll')}>Roll for doubles</button>
+        <button onClick={() => choose('roll')} disabled={othersOpen} title={othersOpen ? 'Settle your other decision first' : undefined}>
+          Roll for doubles
+        </button>
         <button className="secondary" onClick={() => choose('bail')} disabled={me.money < BAIL}>Pay ${BAIL}</button>
         {me.jailCards.length > 0 && <button className="secondary" onClick={() => choose('card')}>Use card</button>}
       </div>
@@ -87,7 +91,7 @@ function CardPrompt({ prompt, act }) {
   );
 }
 
-const PROMPTS = { buy: BuyPrompt, jail: JailPrompt, card: CardPrompt };
+const PROMPTS = { buy: BuyPrompt, jail: JailPrompt, card: CardPrompt, auction: AuctionPrompt };
 
 function PromptDock() {
   const state = useGame((g) => g.state);
@@ -95,13 +99,16 @@ function PromptDock() {
   const me = useMe();
   if (!me) return null;
   const mine = state.prompts.filter((p) => p.player === me.id);
-  if (!mine.length) return null;
+  // Auctions I'm watching, or already locked in for this wave.
+  const watching = state.auctions.filter((a) => !mine.some((p) => p.kind === 'auction' && p.data.auctionId === a.id));
+  if (!mine.length && !watching.length) return null;
   return (
     <div className="prompt-dock">
       {mine.map((p) => {
         const C = PROMPTS[p.kind];
         return C ? <C key={p.id} prompt={p} me={me} act={act} /> : null;
       })}
+      {watching.map((a) => <AuctionWatch key={a.id} auction={a} me={me} />)}
     </div>
   );
 }
@@ -136,7 +143,11 @@ function TurnPanel() {
 
   let status;
   if (!party && !myGo) status = `${state.players[t.current].name}'s go`;
-  else if (t.bonus && party) status = `Bonus roll: ${t.rollers.map((id) => nameOf(state, id)).join(', ')}`;
+  else if (t.bonus && party) {
+    const names = (ids) => ids.map((id) => nameOf(state, id)).join(', ');
+    const allWaiting = waitingOn(state);
+    status = `Bonus roll for ${names(t.rollers)}${allWaiting.length ? ` — waiting on ${names(allWaiting)}` : ''}`;
+  }
   else if (iAmReady && waiting.length) status = `Waiting for ${waiting.map((id) => nameOf(state, id)).join(', ')}`;
   else if (myPrompts.length) status = 'You have a decision to make';
   else status = party ? 'Do your thing, then ready up' : 'Your go';

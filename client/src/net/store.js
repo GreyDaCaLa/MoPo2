@@ -58,6 +58,21 @@ export const useGame = create((set, get) => ({
     if (!res.ok) set({ error: res.error });
   },
 
+  async addBot(difficulty) {
+    const res = await emit('bot:add', { difficulty });
+    if (!res.ok) set({ error: res.error });
+  },
+
+  async removeBot(id) {
+    const res = await emit('bot:remove', { id });
+    if (!res.ok) set({ error: res.error });
+  },
+
+  async setBotDifficulty(id, difficulty) {
+    const res = await emit('bot:difficulty', { id, difficulty });
+    if (!res.ok) set({ error: res.error });
+  },
+
   async customize(patch) {
     const res = await emit('player:customize', patch);
     if (!res.ok) set({ error: res.error });
