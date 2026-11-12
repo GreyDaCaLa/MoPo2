@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { SPACES, GROUPS, BAIL, computeRent, waitingOn, raisableValue } from '@mopo/shared';
 import { useGame, useMe, useServerNow } from '../net/store.js';
 import { AuctionPrompt, AuctionWatch } from './Auction.jsx';
+import { TradeBuilder, TradePrompt, OpenTrades } from './Trade.jsx';
 
 const nameOf = (state, id) => state.players.find((p) => p.id === id)?.name ?? '?';
 const isParty = (state) => state.settings.mode === 'party';
@@ -26,6 +27,7 @@ function Players() {
               {p.bot && <span className="tag">{p.bot.difficulty}</span>}
               {!p.connected && !p.bot && <span className="tag">offline</span>}
               {p.inJail && <span className="tag">lockup</span>}
+              {p.drafting && <span className="tag">setting up a trade…</span>}
             </span>
             {party && !p.bankrupt && (
               <span className={`ready-dot ${ready ? 'on' : ''}`} title={ready ? 'Ready' : 'Not ready'}>{ready ? '✓' : '…'}</span>
@@ -91,7 +93,7 @@ function CardPrompt({ prompt, act }) {
   );
 }
 
-const PROMPTS = { buy: BuyPrompt, jail: JailPrompt, card: CardPrompt, auction: AuctionPrompt };
+const PROMPTS = { buy: BuyPrompt, jail: JailPrompt, card: CardPrompt, auction: AuctionPrompt, trade: TradePrompt };
 
 function PromptDock() {
   const state = useGame((g) => g.state);
@@ -129,20 +131,25 @@ function readyLabel(state, me) {
 function TurnPanel() {
   const state = useGame((g) => g.state);
   const act = useGame((g) => g.act);
+  const openTrade = useGame((g) => g.openTrade);
   const me = useMe();
   if (!me || me.bankrupt) return <div className="panel actions"><p className="muted">Spectating</p></div>;
 
   const t = state.turn;
   const party = isParty(state);
-  const myPrompts = state.prompts.filter((p) => p.player === me.id);
+  const myPrompts = state.prompts.filter((p) => p.player === me.id && p.kind !== 'trade');
   const iAmReady = t.ready.includes(me.id);
   const waiting = waitingOn(state).filter((id) => id !== me.id);
   const myGo = party || state.players[t.current].id === me.id;
   const jailPending = myPrompts.some((p) => p.kind === 'jail');
-  const canReady = myGo && !iAmReady && !myPrompts.length && me.money >= 0;
+  const myTrades = state.trades.filter((tr) => tr.from === me.id || tr.to === me.id);
+  const canReady = myGo && !iAmReady && !myPrompts.length && me.money >= 0 && !me.drafting && !myTrades.length;
 
   let status;
-  if (!party && !myGo) status = `${state.players[t.current].name}'s go`;
+  if (myTrades.length) {
+    const other = (tr) => nameOf(state, tr.from === me.id ? tr.to : tr.from);
+    status = `Finish your trade with ${[...new Set(myTrades.map(other))].join(', ')} before readying`;
+  } else if (!party && !myGo) status = `${state.players[t.current].name}'s go`;
   else if (t.bonus && party) {
     const names = (ids) => ids.map((id) => nameOf(state, id)).join(', ');
     const allWaiting = waitingOn(state);
@@ -174,6 +181,14 @@ function TurnPanel() {
           </button>
         </>
       )}
+      <button
+        className="secondary"
+        onClick={() => openTrade()}
+        disabled={iAmReady || me.drafting}
+        title={iAmReady ? 'Un-ready to make a trade offer' : undefined}
+      >
+        Propose a trade
+      </button>
       <p className="muted small">Build, sell and mortgage any time — click a tile.</p>
     </div>
   );
@@ -189,14 +204,15 @@ function Hotkeys() {
   useEffect(() => {
     const onKey = (e) => {
       const { state, me, act } = latest.current;
-      if (!me || e.repeat || e.target instanceof HTMLInputElement) return;
-      const mine = state.prompts.filter((p) => p.player === me.id);
+      if (!me || e.repeat || e.target instanceof HTMLInputElement || useGame.getState().tradeDraft) return;
+      const mine = state.prompts.filter((p) => p.player === me.id && p.kind !== 'trade');
+      const inTrade = state.trades.some((t) => t.from === me.id || t.to === me.id);
       const buy = mine.find((p) => p.kind === 'buy');
       const card = mine.find((p) => p.kind === 'card');
       const myGo = isParty(state) || state.players[state.turn.current].id === me.id;
       if (e.code === 'Space') {
         e.preventDefault();
-        if (myGo && !mine.length && !state.turn.ready.includes(me.id)) act({ type: 'ready' });
+        if (myGo && !mine.length && !inTrade && !state.turn.ready.includes(me.id)) act({ type: 'ready' });
       }
       else if (e.key === 'b' && buy) act({ type: 'answer', promptId: buy.id, choice: 'buy' });
       else if (e.key === 'p' && buy) act({ type: 'answer', promptId: buy.id, choice: 'pass' });
@@ -338,11 +354,12 @@ export default function Hud() {
         </div>
         <Players />
       </div>
-      <div className="top-right"><SpaceInfo /></div>
+      <div className="top-right"><SpaceInfo /><OpenTrades /></div>
       <div className="bottom-left"><Log /></div>
       <div className="bottom-right"><TurnPanel /></div>
       <div className="bottom-center"><PromptDock /></div>
       <Hotkeys />
+      <TradeBuilder />
       <Toast />
       <GameOver />
     </div>

@@ -58,6 +58,28 @@ export const useGame = create((set, get) => ({
     if (!res.ok) set({ error: res.error });
   },
 
+  // Trade builder: { to, give, get, counterTo } while open. Opening it marks us
+  // as drafting on the server (which blocks readying until we send or cancel).
+  tradeDraft: null,
+
+  async openTrade(init = {}) {
+    const res = await emit('game:action', { type: 'tradeDraft', on: true });
+    if (!res.ok) return set({ error: res.error });
+    const side = () => ({ properties: [], cash: 0, jailCards: 0 });
+    set({ tradeDraft: { to: null, give: side(), get: side(), counterTo: null, ...init } });
+  },
+
+  async closeTrade() {
+    set({ tradeDraft: null });
+    await emit('game:action', { type: 'tradeDraft', on: false });
+  },
+
+  async sendTrade(draft) {
+    const res = await emit('game:action', { type: 'proposeTrade', ...draft });
+    if (!res.ok) return set({ error: res.error });
+    set({ tradeDraft: null });
+  },
+
   async addBot(difficulty) {
     const res = await emit('bot:add', { difficulty });
     if (!res.ok) set({ error: res.error });

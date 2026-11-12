@@ -54,9 +54,9 @@ The engine (`shared/src/engine.js`) is built on three concepts:
   ready to roll". When everyone who should roll is ready, their dice roll together, all pieces move
   at once, then landings resolve in seat order.
 - **Actions** — optional, player-initiated, never block the game: build, sell, mortgage,
-  bankruptcy (later: trading). Allowed any time.
+  propose/withdraw trades, bankruptcy. Allowed any time.
 - **Prompts** — the game asking one player for a decision (`state.prompts`): buy/pass, how to
-  leave Lockup, a drawn card, an auction bid (later: trade responses). You can't ready up with one open.
+  leave Lockup, a drawn card, an auction bid, a trade offer (trade offers never block the game). You can't ready up with one open.
   Each prompt kind has a default used when the turn timer runs out.
 
 ```
@@ -93,6 +93,23 @@ closes live auctions at the current high bid and auto-passes sealed bidders.
 
 Keys: Space = ready/roll, B = buy, P = pass, Enter = acknowledge card.
 
+## Trading
+
+- **Propose a trade** opens the trade builder: pick a player, then choose properties (colour chips),
+  cash and Lockup cards for each side. Recipients get Accept / Reject / **Counter** (a counter is a
+  new offer back, which closes the original).
+- Any property can be traded on its own — except one with buildings on it (sell them first).
+  Mortgaged property stays mortgaged and the receiver pays a 10% fee.
+- Offers are **public** (an "Open offers" panel) and capped at 3 per player. Everything is
+  re-checked on accept; a trade that no longer works is cancelled.
+- **A trade must conclude before anyone in it can ready up** (accepted, rejected, withdrawn or
+  cancelled — counters included). Proposing to a player who's already ready un-readies them.
+  The turn can't end while any trade is open (Classic too); the turn timer, if on, auto-rejects.
+- While you have the builder open you're "setting up a trade" and can't ready up; once ready,
+  un-ready to propose or counter.
+- Bots evaluate offers by how the board looks for them afterwards (Hard hates handing out colour
+  sets) and propose cash offers for streets that complete their own sets.
+
 ## Bots
 
 The host can add bots on the room setup page (Easy / Medium / Hard) and play solo against them.
@@ -104,8 +121,7 @@ The host can add bots on the room setup page (Easy / Medium / Hard) and play sol
   (Hard reacts fastest — it matters when streets are contested in Party). Bots pause when no
   human is connected.
 - `npm run simulate -- 200 classic 50` plays bot-only games and prints win rates per difficulty
-  (args: games, mode, turn limit). Balance this once trading and auctions exist — without them
-  colour sets rarely complete and games stall.
+  (args: games, mode, turn limit).
 
 ## Rules implemented
 

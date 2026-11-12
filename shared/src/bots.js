@@ -3,7 +3,10 @@
 // bot wants to take (or null to wait). The server applies it after a short
 // "thinking" delay from `botDelay`, so bots obey exactly the same rules as people.
 import { SPACES, OWNABLE, groupMembers, BAIL } from './board.js';
-import { computeRent, raisableValue, waitingOn, addPlayer, removePlayer, GameError, LIVE_MIN_BID } from './engine.js';
+import {
+  computeRent, raisableValue, waitingOn, addPlayer, removePlayer, GameError, LIVE_MIN_BID,
+  tradeProblem, mortgageTransferFee, openTradesOf,
+} from './engine.js';
 
 export const BOT_DIFFICULTIES = [
   { id: 'easy', name: 'Easy', description: 'Buys on impulse, rarely builds.' },
@@ -117,6 +120,85 @@ function decideAuction(s, me, auction, diff, rng) {
   return amount >= 1 ? { bid: amount } : 'pass';
 }
 
+// ---------------------------------------------------------------- trades
+
+const SET_BONUS = { easy: 0.2, medium: 0.6, hard: 1.0 }; // value of owning a full colour set
+const RIVAL_SET_PENALTY = { easy: 0, medium: 0.5, hard: 1.0 }; // fear of a rival's full set
+const ACCEPT_MARGIN = { easy: -30, medium: 10, hard: 40 }; // gain needed to accept
+const OFFER_PREMIUM = { easy: 1.2, medium: 1.4, hard: 1.6 }; // cash offered vs list price
+const STREET_GROUPS = [...new Set(SPACES.filter((x) => x.type === 'street').map((x) => x.group))];
+
+const propValue = (s, i) => (s.properties[i].mortgaged ? SPACES[i].price / 2 : SPACES[i].price);
+
+/** How good the board looks for `pid`, in dollars, from a bot's point of view. */
+function positionScore(s, pid, diff) {
+  const me = s.players.find((p) => p.id === pid);
+  let score = me.money + me.jailCards.length * 30;
+  for (const i of OWNABLE) if (s.properties[i].owner === pid) score += propValue(s, i);
+  for (const g of STREET_GROUPS) {
+    const members = groupMembers(g);
+    const owner = s.properties[members[0]].owner;
+    if (!owner || !members.every((i) => s.properties[i].owner === owner)) continue;
+    const value = members.reduce((sum, i) => sum + propValue(s, i), 0);
+    score += owner === pid ? value * SET_BONUS[diff] : -value * RIVAL_SET_PENALTY[diff];
+  }
+  return score;
+}
+
+/** The board after `trade`, for scoring only (players + properties). */
+function afterTrade(s, trade) {
+  const t = structuredClone({ players: s.players, properties: s.properties });
+  const from = t.players.find((p) => p.id === trade.from);
+  const to = t.players.find((p) => p.id === trade.to);
+  const move = (giver, receiver, side) => {
+    for (const i of side.properties) {
+      t.properties[i].owner = receiver.id;
+      if (t.properties[i].mortgaged) receiver.money -= mortgageTransferFee(i);
+    }
+    giver.money -= side.cash;
+    receiver.money += side.cash;
+    for (let n = 0; n < side.jailCards; n++) receiver.jailCards.push(giver.jailCards[n]);
+    giver.jailCards = giver.jailCards.slice(side.jailCards);
+  };
+  move(from, to, trade.give);
+  move(to, from, trade.get);
+  return t;
+}
+
+function decideTrade(s, me, trade, diff, rng) {
+  if (tradeProblem(s, trade)) return 'reject';
+  const gain = positionScore(afterTrade(s, trade), me.id, diff) - positionScore(s, me.id, diff);
+  const noise = diff === 'easy' ? (rng() - 0.5) * 60 : 0;
+  return gain + noise > ACCEPT_MARGIN[diff] ? 'accept' : 'reject';
+}
+
+/** Offer cash for the streets that would complete one of our sets. */
+function maybeProposeTrade(s, me, diff, rng) {
+  if (me.drafting || s.turn.ready.includes(me.id)) return null;
+  if (me.lastProposalTurn === s.turn.number) return null; // one offer per turn
+  if (s.trades.some((t) => t.from === me.id)) return null;
+  if (diff === 'easy' && rng() > 0.15) return null;
+  const keep = diff === 'hard' ? Math.min(reserve(s, me, diff), 150) : reserve(s, me, diff);
+  const candidates = [];
+  for (const g of STREET_GROUPS) {
+    const members = groupMembers(g);
+    const missing = members.filter((i) => s.properties[i].owner !== me.id);
+    if (!missing.length || missing.length === members.length) continue;
+    const owners = new Set(missing.map((i) => s.properties[i].owner));
+    if (owners.size !== 1 || owners.has(null)) continue;
+    if (missing.some((i) => s.properties[i].houses)) continue;
+    const [to] = owners;
+    const cash = Math.ceil((missing.reduce((sum, i) => sum + SPACES[i].price, 0) * OFFER_PREMIUM[diff]) / 10) * 10;
+    if (me.money - cash < keep) continue;
+    const trade = { from: me.id, to, give: { properties: [], cash, jailCards: 0 }, get: { properties: missing, cash: 0, jailCards: 0 } };
+    if (!tradeProblem(s, trade)) candidates.push(trade);
+  }
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => a.give.cash - b.give.cash);
+  const { to, give, get } = candidates[0];
+  return { type: 'proposeTrade', to, give, get };
+}
+
 // ---------------------------------------------------------------- actions
 
 /** Next step toward paying off a debt: sell a building, else mortgage something. */
@@ -195,21 +277,27 @@ export function decideBotAction(s, botId, rng = Math.random) {
     let choice = 'ok';
     if (prompt.kind === 'buy') choice = decideBuy(s, me, prompt.data.index, diff, rng);
     else if (prompt.kind === 'jail') choice = decideJail(s, me, diff, rng);
-    else if (prompt.kind === 'auction') {
+    else if (prompt.kind === 'trade') {
+      const trade = s.trades.find((t) => t.id === prompt.data.tradeId);
+      choice = trade ? decideTrade(s, me, trade, diff, rng) : 'reject';
+    } else if (prompt.kind === 'auction') {
       const auction = s.auctions.find((a) => a.id === prompt.data.auctionId);
       choice = auction ? decideAuction(s, me, auction, diff, rng) : null;
     }
     if (choice != null) return { type: 'answer', promptId: prompt.id, choice };
   }
-  if (myPrompts.length) return null; // e.g. holding the high bid: just wait
+  if (myPrompts.some((p) => p.kind !== 'trade')) return null; // e.g. holding the high bid: just wait
 
   if (me.money < 0) return raisableValue(s, me.id) >= 0 ? raiseMoney(s, me, diff) : null;
 
+  const offer = maybeProposeTrade(s, me, diff, rng);
+  if (offer) return offer;
   const build = maybeBuild(s, me, diff, rng);
   if (build) return build;
   const unmortgage = maybeUnmortgage(s, me, diff);
   if (unmortgage) return unmortgage;
 
+  if (openTradesOf(s, me.id).length) return null; // wait for our offer to be answered
   if (waitingOn(s).includes(me.id)) return { type: 'ready' };
   return null;
 }

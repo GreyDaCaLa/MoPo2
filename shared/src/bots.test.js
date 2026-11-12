@@ -101,3 +101,40 @@ test('bot-only games can end by bankruptcy', () => {
   });
   assert.ok(anyBankrupt);
 });
+
+// ---------------------------------------------------------------- trading
+
+function tradeOffer(s, from, to, give, get) {
+  s.trades.push({ id: 77, from, to, give: { properties: [], cash: 0, jailCards: 0, ...give }, get: { properties: [], cash: 0, jailCards: 0, ...get }, turn: 1 });
+  s.prompts.push({ id: 78, player: to, kind: 'trade', data: { tradeId: 77 } });
+  return decideBotAction(s, to, () => 0.5);
+}
+
+test('hard bot refuses to hand over a colour set at list price, but sells at a big premium', () => {
+  const s = gameVsBot('hard');
+  s.properties[37].owner = 'h'; // human owns Skyline Crest
+  s.properties[39].owner = 'bot-1'; // bot owns Summit Gardens — selling it completes h's set
+  const cheap = tradeOffer(structuredClone(s), 'h', 'bot-1', { cash: 400 }, { properties: [39] });
+  assert.equal(cheap.choice, 'reject');
+  const rich = tradeOffer(structuredClone(s), 'h', 'bot-1', { cash: 1400 }, { properties: [39] });
+  assert.equal(rich.choice, 'accept');
+});
+
+test('bots never accept trades that no longer work', () => {
+  const s = gameVsBot('easy');
+  s.properties[39].owner = 'bot-1';
+  assert.equal(tradeOffer(s, 'h', 'bot-1', { cash: 99999 }, { properties: [39] }).choice, 'reject');
+});
+
+test('medium bot offers cash to complete its set', () => {
+  let s = gameVsBot('medium', { mode: 'party' });
+  s.properties[37].owner = 'bot-1';
+  s.properties[39].owner = 'h';
+  const action = decideBotAction(s, 'bot-1');
+  assert.equal(action.type, 'proposeTrade');
+  assert.equal(action.to, 'h');
+  assert.deepEqual(action.get.properties, [39]);
+  assert.equal(action.give.cash, 560); // 400 × 1.4
+  s = applyAction(s, 'bot-1', action, noShuffle);
+  assert.notEqual(decideBotAction(s, 'bot-1')?.type, 'proposeTrade', 'one offer at a time');
+});

@@ -76,6 +76,8 @@ export function createGame(code, settings) {
     auctions: [], // see "auctions" below
     nextAuctionId: 1,
     nextBidOrder: 1, // sealed bids: who locked in first
+    trades: [], // open offers — see "trades" below
+    nextTradeId: 1,
     lastRolls: null, // { id, rolls: [{ player, d1, d2 }] } — the latest roll event
     pot: 0, // Harbor Rest jackpot
     properties: Object.fromEntries(OWNABLE.map((i) => [i, { owner: null, houses: 0, mortgaged: false }])),
@@ -111,6 +113,8 @@ export function addPlayer(state, id, name) {
     debtTo: null,
     connected: true,
     bot: null, // { difficulty } for computer players
+    drafting: false, // has the trade builder open (can't ready up)
+    lastProposalTurn: 0,
   });
   if (!s.hostId) s.hostId = id;
   log(s, `${s.players.at(-1).name} joined.`);
@@ -274,7 +278,7 @@ function moveTo(s, p, to) {
 
 // ---------------------------------------------------------------- prompts
 
-export const PROMPT_DEFAULTS = { buy: 'pass', jail: 'roll', card: 'ok', auction: 'pass' };
+export const PROMPT_DEFAULTS = { buy: 'pass', jail: 'roll', card: 'ok', auction: 'pass', trade: 'reject' };
 
 function addPrompt(s, player, kind, data = {}) {
   const prompt = { id: s.nextPromptId++, player: player.id, kind, data };
@@ -284,8 +288,14 @@ function addPrompt(s, player, kind, data = {}) {
 
 const promptsOf = (s, playerId) => s.prompts.filter((p) => p.player === playerId);
 
-/** Open decisions caused by landings (everything except Lockup, which is about the next roll). */
-export const landingPrompts = (s) => s.prompts.filter((p) => p.kind !== 'jail');
+/** Open decisions caused by landings (not Lockup, which is about the next roll, and not trade offers). */
+export const landingPrompts = (s) => s.prompts.filter((p) => p.kind !== 'jail' && p.kind !== 'trade');
+
+/** Prompts that stop a player from readying up. */
+const blockingPromptsOf = (s, playerId) => s.prompts.filter((p) => p.player === playerId);
+
+/** Open trades this player is part of (as proposer or recipient). */
+export const openTradesOf = (s, playerId) => s.trades.filter((t) => t.from === playerId || t.to === playerId);
 
 function resolveLanding(s, p, diceTotal, ctx) {
   const space = SPACES[p.position];
@@ -439,7 +449,148 @@ function answerPrompt(s, me, prompt, choice, ctx) {
     case 'auction':
       auctionAnswer(s, me, prompt, choice, ctx);
       return;
+    case 'trade': {
+      const trade = s.trades.find((t) => t.id === prompt.data.tradeId);
+      if (!trade) {
+        done();
+        return;
+      }
+      if (choice === 'accept') acceptTrade(s, trade);
+      else if (choice === 'reject') closeTrade(s, trade, `${me.name} rejected ${playerById(s, trade.from).name}'s offer.`);
+      else fail('Choose accept or reject');
+      return;
+    }
   }
+}
+
+// ---------------------------------------------------------------- trades
+//
+// Proposing/withdrawing a trade is an ACTION; the recipient gets a 'trade'
+// PROMPT (accept / reject — countering = proposing back with `counterTo`).
+//
+//   - Neither side of an open trade can ready up until it concludes (accepted,
+//     rejected, withdrawn or cancelled). Proposing to a player who is already
+//     ready un-readies them. The turn can't end while any trade is open (in
+//     Classic too); the turn timer (if on) breaks a stall by auto-rejecting.
+//   - Offers are public, capped at MAX_OPEN_TRADES per proposer, and expire
+//     at the end of the turn.
+//   - Any property can be traded on its own, unless it has buildings on it.
+//     Mortgaged property stays mortgaged; the receiver pays a 10% fee.
+//   - While a player has the trade builder open (`drafting`) they can't ready
+//     up. Once ready, they must un-ready before drafting or proposing again.
+//   - Everything is re-checked on accept; a trade that no longer works is
+//     cancelled with a reason instead.
+
+export const MAX_OPEN_TRADES = 3;
+export const mortgageTransferFee = (index) => Math.ceil((SPACES[index].price / 2) * 0.1);
+
+function normalizeSide(side = {}) {
+  const properties = [...new Set((side.properties || []).map(Number))];
+  const cash = Math.floor(Number(side.cash) || 0);
+  const jailCards = Math.floor(Number(side.jailCards) || 0);
+  if (cash < 0 || jailCards < 0) fail('Amounts must be positive');
+  return { properties, cash, jailCards };
+}
+
+const sideEmpty = (side) => !side.properties.length && !side.cash && !side.jailCards;
+
+/** Mortgage fees `receiver` would owe for the properties in `side`. */
+const feesFor = (s, side) => side.properties.reduce((sum, i) => sum + (s.properties[i].mortgaged ? mortgageTransferFee(i) : 0), 0);
+
+function sideProblem(s, giver, side) {
+  for (const i of side.properties) {
+    const space = SPACES[i];
+    if (!space || space.price == null) return 'That is not an ownable space';
+    const prop = s.properties[i];
+    if (prop.owner !== giver.id) return `${giver.name} doesn't own ${space.name}`;
+    if (prop.houses > 0) return `${space.name} has buildings — sell them first`;
+  }
+  if (side.cash > Math.max(0, giver.money)) return `${giver.name} doesn't have ${fmt(side.cash)}`;
+  if (side.jailCards > giver.jailCards.length) return `${giver.name} doesn't have that many Lockup cards`;
+  return null;
+}
+
+/** Why `trade` can't happen right now, or null. */
+export function tradeProblem(s, trade) {
+  const from = playerById(s, trade.from);
+  const to = playerById(s, trade.to);
+  if (!from || !to || from.bankrupt || to.bankrupt) return 'a player in this trade is out of the game';
+  const problem = sideProblem(s, from, trade.give) || sideProblem(s, to, trade.get);
+  if (problem) return problem;
+  // Mortgage fees can't push anyone (further) into debt.
+  const fromAfter = from.money - trade.give.cash + trade.get.cash - feesFor(s, trade.get);
+  const toAfter = to.money - trade.get.cash + trade.give.cash - feesFor(s, trade.give);
+  if (fromAfter < Math.min(0, from.money)) return `${from.name} couldn't cover the mortgage fees`;
+  if (toAfter < Math.min(0, to.money)) return `${to.name} couldn't cover the mortgage fees`;
+  return null;
+}
+
+function sideText(side) {
+  const parts = side.properties.map((i) => SPACES[i].name);
+  if (side.cash) parts.push(fmt(side.cash));
+  if (side.jailCards) parts.push(`${side.jailCards} Lockup card${side.jailCards > 1 ? 's' : ''}`);
+  return parts.join(' + ') || 'nothing';
+}
+
+function closeTrade(s, trade, reason) {
+  s.trades = s.trades.filter((t) => t.id !== trade.id);
+  s.prompts = s.prompts.filter((x) => !(x.kind === 'trade' && x.data.tradeId === trade.id));
+  if (reason) log(s, reason);
+}
+
+function proposeTrade(s, me, { to, give, get, counterTo }) {
+  if (s.turn.ready.includes(me.id)) fail('Un-ready to make a trade offer');
+  const partner = playerById(s, to);
+  if (!partner || partner.bankrupt || partner.id === me.id) fail('Pick another player to trade with');
+  if (counterTo != null) {
+    const original = s.trades.find((t) => t.id === counterTo && t.to === me.id && t.from === partner.id);
+    if (!original) fail('That offer is no longer open');
+    closeTrade(s, original, `${me.name} countered ${partner.name}'s offer.`);
+  }
+  if (s.trades.filter((t) => t.from === me.id).length >= MAX_OPEN_TRADES) fail(`You can have at most ${MAX_OPEN_TRADES} open offers`);
+  const trade = { id: s.nextTradeId++, from: me.id, to: partner.id, give: normalizeSide(give), get: normalizeSide(get), turn: s.turn.number };
+  if (sideEmpty(trade.give) && sideEmpty(trade.get)) fail('The offer is empty');
+  const problem = tradeProblem(s, trade);
+  if (problem) fail(problem.charAt(0).toUpperCase() + problem.slice(1));
+  s.trades.push(trade);
+  addPrompt(s, partner, 'trade', { tradeId: trade.id });
+  // The recipient has to decide before they can (re-)ready.
+  s.turn.ready = s.turn.ready.filter((id) => id !== partner.id);
+  me.drafting = false;
+  me.lastProposalTurn = s.turn.number;
+  log(s, `${me.name} offers ${partner.name}: ${sideText(trade.give)} for ${sideText(trade.get)}.`);
+}
+
+function transfer(s, giver, receiver, side) {
+  for (const i of side.properties) {
+    s.properties[i].owner = receiver.id;
+    if (s.properties[i].mortgaged) pay(s, receiver, null, mortgageTransferFee(i), `10% fee on mortgaged ${SPACES[i].name}`);
+  }
+  if (side.cash) {
+    giver.money -= side.cash;
+    receiver.money += side.cash;
+  }
+  for (let n = 0; n < side.jailCards; n++) receiver.jailCards.push(giver.jailCards.shift());
+}
+
+function acceptTrade(s, trade) {
+  const problem = tradeProblem(s, trade);
+  if (problem) {
+    closeTrade(s, trade, `Trade cancelled: ${problem}.`);
+    return;
+  }
+  const from = playerById(s, trade.from);
+  const to = playerById(s, trade.to);
+  closeTrade(s, trade);
+  log(s, `Trade done! ${from.name} gave ${sideText(trade.give)}; ${to.name} gave ${sideText(trade.get)}.`);
+  transfer(s, from, to, trade.give);
+  transfer(s, to, from, trade.get);
+}
+
+function expireTrades(s) {
+  if (!s.trades.length) return;
+  for (const t of [...s.trades]) closeTrade(s, t);
+  log(s, 'Open trade offers expired.');
 }
 
 // ---------------------------------------------------------------- auctions
@@ -646,7 +797,10 @@ export function waitingOn(s) {
     const deciding = landingPrompts(s).map((p) => p.player);
     return [...new Set([...t.rollers.filter((id) => !t.ready.includes(id)), ...deciding])];
   }
-  const deciding = landingPrompts(s).map((p) => p.player);
+  const deciding = [
+    ...landingPrompts(s).map((p) => p.player),
+    ...s.trades.flatMap((t) => [t.from, t.to]), // the turn can't end mid-trade
+  ];
   if (isParty(s)) return [...new Set([...alive(s).filter((p) => !t.ready.includes(p.id)).map((p) => p.id), ...deciding])];
   const cur = s.players[t.current];
   return [...new Set([...(t.ready.includes(cur.id) ? [] : [cur.id]), ...deciding])];
@@ -671,6 +825,7 @@ function beginTurn(s, ctx) {
 
 function nextTurn(s, ctx) {
   const t = s.turn;
+  expireTrades(s);
   if (isParty(s)) {
     t.number++;
   } else {
@@ -691,7 +846,9 @@ function markReady(s, me) {
   const t = s.turn;
   if (!isParty(s) && s.players[t.current].id !== me.id) fail('Not your turn');
   if (t.ready.includes(me.id)) fail('You are already ready');
-  if (promptsOf(s, me.id).length) fail('Answer your open decisions first');
+  if (blockingPromptsOf(s, me.id).length) fail('Answer your open decisions first');
+  if (me.drafting) fail('Send or cancel your trade offer first');
+  if (openTradesOf(s, me.id).length) fail('Finish your open trade first');
   if (me.money < 0) fail('Raise money or declare bankruptcy first');
   t.ready.push(me.id);
 }
@@ -778,7 +935,7 @@ function settle(s, ctx) {
       const done = isParty(s)
         ? alive(s).every((p) => t.ready.includes(p.id))
         : s.players[t.current].bankrupt || t.ready.includes(s.players[t.current].id);
-      if (done && !landingPrompts(s).length) {
+      if (done && !landingPrompts(s).length && !s.trades.length) {
         nextTurn(s, ctx);
         continue;
       }
@@ -830,6 +987,8 @@ function goBankrupt(s, me, reason = '') {
   }
   // Return any card this player was still looking at.
   for (const pr of promptsOf(s, me.id)) if (pr.kind === 'card') s.decks[pr.data.deck].push(pr.data.cardIdx);
+  for (const t of s.trades.filter((x) => x.from === me.id || x.to === me.id)) closeTrade(s, t);
+  me.drafting = false;
   for (const a of s.auctions.filter((x) => x.participants.includes(me.id))) {
     removeFromAuction(s, a, me.id);
     if (a.format === 'live') checkLiveAuction(s, a);
@@ -873,6 +1032,26 @@ export function applyAction(state, playerId, action, opts) {
     case 'ready':
       markReady(s, me);
       break;
+
+    case 'tradeDraft':
+      if (action.on) {
+        if (s.turn.ready.includes(me.id)) fail('Un-ready to set up a trade');
+        me.drafting = true;
+      } else {
+        me.drafting = false;
+      }
+      break;
+
+    case 'proposeTrade':
+      proposeTrade(s, me, action);
+      break;
+
+    case 'withdrawTrade': {
+      const trade = s.trades.find((t) => t.id === action.tradeId && t.from === me.id);
+      if (!trade) fail('That offer is no longer open');
+      closeTrade(s, trade, `${me.name} withdrew their offer to ${playerById(s, trade.to).name}.`);
+      break;
+    }
 
     case 'unready':
       if (!s.turn.ready.includes(me.id)) fail('You are not ready');
@@ -965,6 +1144,7 @@ export function expireTurn(state, opts) {
   const s = structuredClone(state);
   log(s, "Time's up for this turn!");
   closeLiveAuctions(s, ctx, true); // sold to the current high bidder, if any
+  for (const p of s.players) p.drafting = false;
   for (let guard = 0; guard < 50 && s.prompts.length; guard++) {
     const prompt = s.prompts.find((x) => x.kind !== 'jail') ?? s.prompts[0]; // Lockup choice last
     const p = playerById(s, prompt.player);
